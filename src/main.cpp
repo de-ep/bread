@@ -1,4 +1,3 @@
-#include <iostream>
 #include <string>
 #include <sys/inotify.h>
 #include <pthread.h>
@@ -8,6 +7,7 @@
 #include <filesystem> 
 #include <gpgme.h>
 #include <fcntl.h>
+#include "log.h"
 
 #define MAX_BUFFER_SIZE 1024
 #define MAX_THREADS 8
@@ -22,10 +22,15 @@ pthread_mutex_t job_lock;
 pthread_cond_t job_cond;
 
 
-void signal_handler(int signum) {
-    printf("Signal: %d recieved, exiting\n", signum);
+void quit() {
     running = false;
     pthread_cond_broadcast(&job_cond);
+
+}
+
+void signal_handler(int signum) {
+    log(LV_INFO, "Signal: " + std::to_string(signum) + " recieved, exiting\n");
+    quit();
 }
 
 
@@ -55,38 +60,38 @@ int encrypt(const char* file) {
 
     err = gpgme_new(&ctx);
     if (err != GPG_ERR_NO_ERROR) {
-        fprintf(stderr, "Failed to create GPGME context: %u\n", err);
+        log(LV_ERROR, "Failed to create GPGME context: " + std::to_string(err) + "\n");
         goto cleanup;
     }
 
     err = gpgme_set_protocol(ctx, GPGME_PROTOCOL_OPENPGP);
     if (err != GPG_ERR_NO_ERROR) {
-        fprintf(stderr, "Failed to set GPGME protocol: %u\n", err);
+        log(LV_ERROR, "Failed to set GPGME protocol: " + std::to_string(err) + "\n");
         goto cleanup;
     }
 
 
     err = gpgme_data_new(&plain);
     if (err != GPG_ERR_NO_ERROR) {
-        fprintf(stderr, "Failed to create data from file: %u\n", err);
+        log(LV_ERROR, "Failed to create data from file: " + std::to_string(err) + "\n");
         goto cleanup;
     }
     err = gpgme_data_set_file_name(plain, file);  
     if (err == GPG_ERR_ENOMEM) {
-        fprintf(stderr, "Failed to set file name: not enough memory is available.\n");
+        log(LV_ERROR, "Failed to set file name: not enough memory is available.\n");
         goto cleanup;
     }
 
     err = gpgme_data_new(&cypher);
     if (err != GPG_ERR_NO_ERROR) {
-        fprintf(stderr, "Failed to create cipher data: %u\n", err);
+        log(LV_ERROR, "Failed to create cipher data: " + std::to_string(err) + "\n");
         goto cleanup;
     }
 
 
     err = gpgme_get_key(ctx, recipient, &key, 0);
     if (key == NULL) {
-        fprintf(stderr, "Failed to get key: %u\n", err);
+        log(LV_ERROR, "Failed to get key: " + std::to_string(err) + "\n");
         goto cleanup;
     }
 
@@ -95,7 +100,7 @@ int encrypt(const char* file) {
    
     err = gpgme_op_encrypt(ctx, recipients, GPGME_ENCRYPT_FILE, plain, cypher);
     if (err != GPG_ERR_NO_ERROR) {
-        fprintf(stderr, "Encryption failed: %u\n", err);
+        log(LV_ERROR, "Encryption failed: " + std::to_string(err) + "\n");
         goto cleanup;
     }
    
@@ -105,12 +110,12 @@ int encrypt(const char* file) {
     if (data != NULL) { 
        fd = fopen(file, "wb");
         if (fd == NULL) {
-            fprintf(stderr, "Failed to open output file for writing\n");
+            log(LV_ERROR, "Failed to open output file for writing\n");
             goto cleanup;
         }
 
         if(fwrite(data, 1, size, fd) != size ) {
-            fprintf(stderr, "Failed to write encrypted data to file\n");
+            log(LV_ERROR, "Failed to write encrypted data to file\n");
             err = 1; 
         }
 
@@ -118,7 +123,7 @@ int encrypt(const char* file) {
         fclose(fd);
     }
     else {
-        fprintf(stderr, "Failed to retrive encrypted data\n");
+        log(LV_ERROR, "Failed to retrive encrypted data\n");
         err = 1;
     }
     
@@ -137,7 +142,7 @@ void* handle_thread (void* tid){
 
     for (;;) {
         pthread_mutex_lock(&job_lock); 
-        pthread_cond_wait(&job_cond, &job_lock);
+        pthread_cond_wait(&job_cond, &job_lock);log(LV_INFO, "wait over \n");
 
         //if we get here and there are no jobs or !running, the thread was woken up by signal handler and we need to exit 
         if (job.empty() || !running) {
@@ -164,20 +169,21 @@ void* handle_thread (void* tid){
 
             continue;
         }
-        printf("thread: %lu processing: %s\n", (pthread_t)tid, path.c_str());
         
-
         if(encrypt(path.c_str()))
-            printf("Encrypted: %s\n", path.c_str());
-        else 
-            printf("Failed to encrypt: %s\n", path.c_str());
-
+            log(LV_INFO, "Encrypted: " + path + "\n");
+        else {
+            log(LV_ERROR, "Failed to encrypt: " + path + "\n");
+            quit();
+        }
     }
     return 0;
 }
 
 
 int main (int argc, char* argv[]) {
+    int err = 0;
+
     if (argc < 3) {
         fprintf(stderr, "Usage: ./bread <directory> <recipient>\n");
         return EXIT_FAILURE;
@@ -189,51 +195,79 @@ int main (int argc, char* argv[]) {
         return EXIT_FAILURE;
     }
 
-    if (daemon(1, 0) == -1) {
-        perror("Unable to daemonize the process");
-        return EXIT_FAILURE;
-    }
-
     std::string dir_path = argv[1];
     if (dir_path.back() != '/')
         dir_path.append("/");
 
     recipient = argv[2];
-    
     LOG_FILE = dir_path + LOG_FILE;
-    FILE* file = fopen(LOG_FILE.c_str(), "w");
-    if (!file)
-        exit(1);
-    fclose(file);
+
 
     int fd = inotify_init();
-    if (fd == -1)
-        exit(1);
+    if (fd == -1) {
+        perror("Failed to initialize inotify instance");
+        return EXIT_FAILURE;
+    }
 
     int iaw = inotify_add_watch(fd, dir_path.c_str(), IN_MOVED_TO);
-    if (iaw == -1)
-        exit(1);
+    if (iaw == -1) {
+        perror("Failed to add watch entry to inotify instance");
+        return EXIT_FAILURE;
+    }
     
     if (!set_fd_nonblock(fd)){
-        fprintf(stderr, "failed to mark fd as nonblocking");
+        perror("Failed to mark inotify fd as nonblocking");
         return EXIT_FAILURE;
     }
     
     pthread_t tid[MAX_THREADS];
-    pthread_mutex_init(&job_lock, NULL);
-    pthread_cond_init(&job_cond, NULL);
-
-    for (int i = 0 ; i < MAX_THREADS ; i++ ) {
-        pthread_create(&tid[i], NULL, handle_thread, (void* ) &tid[i]);
+    err = pthread_mutex_init(&job_lock, NULL);
+    if (err) {
+        perror("Failed to initialize mutex");
+        return EXIT_FAILURE;
+    }
+    err = pthread_cond_init(&job_cond, NULL);
+    if (err) {
+        perror("Failed to initialize conditional variable");
+        return EXIT_FAILURE;
+    }
+    err = pthread_mutex_init(&log_lock, NULL);
+    if (err) {
+        perror("Failed to initialize mutex");
+        return EXIT_FAILURE;
     }
 
 
-    signal(SIGINT, signal_handler);
-    signal(SIGTERM, signal_handler);
+    if (daemon(1, 1) == -1) {
+        perror("Unable to daemonize the process");
+        return EXIT_FAILURE;
+    }
+
+
+    for (int i = 0 ; i < MAX_THREADS ; i++ ) {
+        err = pthread_create(&tid[i], NULL, handle_thread, (void* ) &tid[i]);
+        if (err) {
+            log(LV_ERROR, "Failed to spawn threads");
+            return EXIT_FAILURE;
+        }
+
+    }
+
+
+    if (signal(SIGINT, signal_handler) == SIG_ERR){
+        log(LV_ERROR, "Failed to set signal handler\n");
+        quit();
+    }
+    if (signal(SIGTERM, signal_handler) == SIG_ERR){
+        log(LV_ERROR, "Failed to set signal handler\n");
+        quit();
+    }
 
 
     char buf[MAX_BUFFER_SIZE];
     while (running) {
+        if (!log_write(LOG_FILE.c_str()))
+            quit();
         
         ssize_t read_count = read(fd, buf, sizeof(buf));
         if (read_count == -1) {
@@ -242,7 +276,7 @@ int main (int argc, char* argv[]) {
                 continue;
             }
             else
-            return EXIT_FAILURE;
+            quit();
         }
         
         size_t prev_len = 0;
@@ -260,7 +294,7 @@ int main (int argc, char* argv[]) {
         
             pthread_cond_signal(&job_cond);
             pthread_mutex_unlock(&job_lock);
-            std::cout << "added " << path << " to jobs" << std::endl;
+            
             prev_len += sizeof(struct inotify_event) + ev->len; 
             if (prev_len >= read_count)
                 break;
@@ -271,13 +305,15 @@ int main (int argc, char* argv[]) {
 
     cleanup: 
         if (inotify_rm_watch(fd, iaw) == -1)
-            perror("Failed to remove an existing watch from an inotify instance");
+            log(LV_ERROR, "Failed to remove an existing watch from an inotify instance");
 
         for (int i = 0 ; i < MAX_THREADS ; i++) {
             if (pthread_join(tid[i], NULL) != 0)
-                perror("Failed to join thread");
+                log(LV_ERROR, "Failed to join thread");
         }
 
+        if (!log_write(LOG_FILE.c_str()))
+            quit();
 
     return EXIT_SUCCESS;
 }
