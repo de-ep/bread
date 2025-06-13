@@ -1,18 +1,18 @@
 # Bread
 
-Bread is a multithreaded encryption daemon that monitors the specified directory for files that are moved into it. Upon detecting a new file, the daemon encrypts the file using OpenPGP standard.
+Bread is a multithreaded encryption daemon that monitors the specified directory for files that are moved into it. Upon detecting a new file, the daemon encrypts the file using OpenPGP standard, in case a directory is moved into monitored directory, the daemon encrypts the files present inside the directory recursively.
 **Note: The daemon only processes files that are moved into the directory, not those that are copied.**
 
 The logs can be found in bread.log file in monitored directory.
 
-# Features:
+## Features:
 
 - **Secure decryption key**: Files are encrypted using a public key, ensuring that the decryption key remains protected and secure.
 - **Cryptographically secure encryption**: The daemon uses the GPGME library, which provides a high-level interface to GnuPG, ensuring that the encryption is cryptographically secure.
 - **High performance**: The daemon is multithreaded, ensuring high-speed processing and efficient handling of multiple file encryption tasks simultaneously.
 
 
-# Getting started: 
+## Getting started: 
 
 ### Installing gpgme: 
 On debian: 
